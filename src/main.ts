@@ -14,6 +14,9 @@ type JobRecord = {
 type ResultJson = {
   job_id: string
   status: string
+  created_at?: string
+  started_at?: string
+  completed_at?: string
   input: { text_chars: number }
   model?: { name?: string; source?: string }
   mesh?: { vertex_count?: number; surface?: string }
@@ -48,6 +51,23 @@ type RegionScore = Region & {
   score: number
   series: number[]
 }
+
+type StoredRun = {
+  jobId: string
+  status: JobStatus
+  apiBase: string
+  textPreview: string
+  textChars: number
+  createdAt: string
+  updatedAt: string
+  elapsedSeconds?: number
+  result?: ResultJson
+  predictionBinBase64?: string
+  error?: string | null
+}
+
+const HISTORY_KEY = 'tribeRunHistory.v1'
+const MAX_HISTORY = 12
 
 const REGIONS: Region[] = [
   {
@@ -104,6 +124,9 @@ const els = {
   statusDetail: byId<HTMLElement>('status-detail'),
   jobId: byId<HTMLElement>('job-id'),
   elapsed: byId<HTMLElement>('elapsed'),
+  lastUpdate: byId<HTMLElement>('last-update'),
+  historyList: byId<HTMLElement>('history-list'),
+  clearHistory: byId<HTMLButtonElement>('clear-history-button'),
   meta: byId<HTMLElement>('metadata'),
   regionGrid: byId<HTMLElement>('region-grid'),
   resultPanel: byId<HTMLElement>('result-panel'),
@@ -122,6 +145,8 @@ const state: {
   selectedTimestep: number
   poll?: number
   startedAt?: number
+  activeJobId?: string
+  activeTextPreview?: string
 } = {
   regionScores: [],
   selectedTimestep: 0,
@@ -131,6 +156,7 @@ els.apiBase.value = localStorage.getItem('tribeApiBase') || '/api'
 els.token.value = localStorage.getItem('tribeBearerToken') || ''
 
 els.run.addEventListener('click', () => void submitText())
+els.clearHistory.addEventListener('click', clearHistory)
 els.sample.addEventListener('click', () => {
   els.text.value =
     'Picture a creator opening with a sharp question, then moving through a vivid example, a surprising data point, and a concise call to action. The pacing is calm at first, then becomes more emotionally direct and visually concrete.'
@@ -142,6 +168,8 @@ els.timestep.addEventListener('input', () => {
 
 void loadMetadata()
 renderEmpty()
+renderHistory()
+resumeNewestUnfinishedRun()
 
 async function submitText() {
   const text = els.text.value.trim()
@@ -156,6 +184,7 @@ async function submitText() {
   setBusy(true)
   setStatus('Submitting', 'Creating a text prediction job...')
   state.startedAt = Date.now()
+  state.activeTextPreview = text.slice(0, 140)
 
   try {
     const job = await apiFetch<JobRecord>('/predict/text', {
@@ -164,6 +193,16 @@ async function submitText() {
       headers: { 'Content-Type': 'application/json' },
     })
     els.jobId.textContent = job.job_id
+    state.activeJobId = job.job_id
+    upsertRun({
+      jobId: job.job_id,
+      status: job.status,
+      apiBase: currentApiBase(),
+      textPreview: state.activeTextPreview,
+      textChars: text.length,
+      createdAt: job.created_at || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    })
     pollJob(job.job_id)
   } catch (error) {
     setBusy(false)
@@ -183,12 +222,33 @@ async function checkJob(jobId: string) {
     updateElapsed()
     if (job.status === 'queued' || job.status === 'running') {
       setStatus(job.status === 'queued' ? 'Queued' : 'Running', 'The CPU worker is processing one job at a time.')
+      upsertRun({
+        jobId,
+        status: job.status,
+        apiBase: currentApiBase(),
+        textPreview: existingRun(jobId)?.textPreview || state.activeTextPreview || 'Text run',
+        textChars: existingRun(jobId)?.textChars || 0,
+        createdAt: job.created_at || existingRun(jobId)?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        elapsedSeconds: elapsedSeconds(),
+      })
       return
     }
     window.clearInterval(state.poll)
     if (job.status === 'failed') {
       setBusy(false)
       setStatus('Failed', job.error || 'The API reported a failed job.')
+      upsertRun({
+        jobId,
+        status: 'failed',
+        apiBase: currentApiBase(),
+        textPreview: existingRun(jobId)?.textPreview || state.activeTextPreview || 'Text run',
+        textChars: existingRun(jobId)?.textChars || 0,
+        createdAt: job.created_at || existingRun(jobId)?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        elapsedSeconds: elapsedSeconds(),
+        error: job.error,
+      })
       return
     }
     setStatus('Fetching result', 'Downloading reduced metadata and prediction blob...')
@@ -205,14 +265,33 @@ async function checkJob(jobId: string) {
 async function loadResult(jobId: string) {
   const result = await apiFetch<ResultJson>(`/jobs/${jobId}/result.json`)
   const blob = await apiFetch<ArrayBuffer>(`/jobs/${jobId}/preds.norm.f16.bin`, undefined, 'arrayBuffer')
+  applyResult(result, blob)
+  upsertRun({
+    jobId,
+    status: 'completed',
+    apiBase: currentApiBase(),
+    textPreview: existingRun(jobId)?.textPreview || state.activeTextPreview || 'Text run',
+    textChars: result.input.text_chars,
+    createdAt: result.created_at || existingRun(jobId)?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    elapsedSeconds: elapsedSecondsFromResult(result) ?? elapsedSeconds(),
+    result,
+    predictionBinBase64: arrayBufferToBase64(blob),
+  })
+}
+
+function applyResult(result: ResultJson, blob: ArrayBuffer) {
   state.result = result
   state.preds = decodeFloat16Array(blob)
+  state.activeJobId = result.job_id
   state.selectedTimestep = 0
   state.regionScores = computeRegionScores(result, state.preds)
   els.timestep.max = String(Math.max(0, result.prediction.shape[0] - 1))
   els.timestep.value = '0'
   els.resultPanel.hidden = false
   els.rawJson.textContent = JSON.stringify(result, null, 2)
+  els.jobId.textContent = result.job_id
+  els.elapsed.textContent = `${elapsedSecondsFromResult(result) ?? elapsedSeconds()}s`
   renderAll()
 }
 
@@ -276,6 +355,7 @@ function renderAll() {
     result.summary.note ||
     'Region scores are approximate frontend reductions until the API exposes atlas-backed Yeo7 and Destrieux outputs.'
   els.statusDetail.textContent = `${result.prediction.shape[0]} timesteps, ${result.prediction.shape[1].toLocaleString()} vertices, ${result.events.count} events`
+  els.lastUpdate.textContent = formatTime(new Date())
   renderCards(t)
   renderTimeline(t)
   renderBrain(t)
@@ -454,6 +534,7 @@ function resetResult() {
   state.selectedTimestep = 0
   els.jobId.textContent = '--'
   els.elapsed.textContent = '--'
+  els.lastUpdate.textContent = '--'
   els.resultPanel.hidden = true
   els.rawJson.textContent = ''
   renderEmpty()
@@ -508,6 +589,181 @@ function setStatus(status: string, detail: string) {
 function updateElapsed() {
   if (!state.startedAt) return
   els.elapsed.textContent = `${Math.round((Date.now() - state.startedAt) / 1000)}s`
+  els.lastUpdate.textContent = formatTime(new Date())
+}
+
+function resumeNewestUnfinishedRun() {
+  const run = getHistory().find((item) => item.status === 'queued' || item.status === 'running')
+  if (!run) return
+  els.apiBase.value = run.apiBase || els.apiBase.value
+  els.jobId.textContent = run.jobId
+  state.activeJobId = run.jobId
+  state.activeTextPreview = run.textPreview
+  state.startedAt = Date.now() - (run.elapsedSeconds || 0) * 1000
+  setBusy(true)
+  setStatus('Resuming', `Checking unfinished job from ${formatDateTime(run.updatedAt)}.`)
+  pollJob(run.jobId)
+}
+
+function getHistory(): StoredRun[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY)
+    const parsed = raw ? JSON.parse(raw) : []
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+function saveHistory(runs: StoredRun[]) {
+  const trimmed = runs
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+    .slice(0, MAX_HISTORY)
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(trimmed))
+  } catch {
+    const lighter = trimmed.map((run) => ({ ...run, predictionBinBase64: undefined }))
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(lighter))
+    } catch {
+      const metadataOnly = lighter.map((run) => ({ ...run, result: undefined }))
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(metadataOnly.slice(0, 6)))
+    }
+  }
+  renderHistory()
+}
+
+function upsertRun(run: StoredRun) {
+  const runs = getHistory().filter((item) => item.jobId !== run.jobId)
+  saveHistory([{ ...existingRun(run.jobId), ...run }, ...runs])
+}
+
+function existingRun(jobId: string): StoredRun | undefined {
+  return getHistory().find((run) => run.jobId === jobId)
+}
+
+function renderHistory() {
+  const runs = getHistory()
+  if (!runs.length) {
+    els.historyList.innerHTML = '<p class="note">Completed and in-progress jobs will appear here.</p>'
+    return
+  }
+  els.historyList.innerHTML = runs
+    .map((run) => `
+      <article class="history-item" data-job-id="${escapeHtml(run.jobId)}">
+        <button class="history-main" type="button" data-history-open="${escapeHtml(run.jobId)}">
+          <span class="history-title">${escapeHtml(run.textPreview || run.jobId)}</span>
+          <span class="history-meta">${escapeHtml(run.status)} · ${run.textChars || 0} chars · ${formatDateTime(run.updatedAt)}</span>
+        </button>
+        <button class="history-delete" type="button" data-history-delete="${escapeHtml(run.jobId)}" aria-label="Delete ${escapeHtml(run.jobId)}">×</button>
+      </article>
+    `)
+    .join('')
+
+  els.historyList.querySelectorAll<HTMLButtonElement>('[data-history-open]').forEach((button) => {
+    button.addEventListener('click', () => void openStoredRun(button.dataset.historyOpen || ''))
+  })
+  els.historyList.querySelectorAll<HTMLButtonElement>('[data-history-delete]').forEach((button) => {
+    button.addEventListener('click', () => deleteRun(button.dataset.historyDelete || ''))
+  })
+}
+
+async function openStoredRun(jobId: string) {
+  const run = existingRun(jobId)
+  if (!run) return
+  els.apiBase.value = run.apiBase || els.apiBase.value
+  els.jobId.textContent = run.jobId
+  els.elapsed.textContent = run.elapsedSeconds ? `${run.elapsedSeconds}s` : '--'
+  els.lastUpdate.textContent = formatDateTime(run.updatedAt)
+
+  if (run.status === 'completed' && run.result && run.predictionBinBase64) {
+    setStatus('Loaded saved run', 'Result restored from local storage.')
+    applyResult(run.result, base64ToArrayBuffer(run.predictionBinBase64))
+    return
+  }
+
+  if (run.status === 'completed') {
+    setStatus('Fetching saved run', 'Prediction blob was not stored locally, trying the API.')
+    await loadResult(run.jobId)
+    setStatus('Complete', 'Prediction ready.')
+    return
+  }
+
+  if (run.status === 'failed') {
+    resetResult()
+    els.jobId.textContent = run.jobId
+    setStatus('Failed', run.error || 'This saved job failed.')
+    return
+  }
+
+  resetResult()
+  els.jobId.textContent = run.jobId
+  state.startedAt = Date.now() - (run.elapsedSeconds || 0) * 1000
+  setBusy(true)
+  setStatus('Resuming', 'Polling saved in-progress job.')
+  pollJob(run.jobId)
+}
+
+function deleteRun(jobId: string) {
+  saveHistory(getHistory().filter((run) => run.jobId !== jobId))
+  if (state.activeJobId === jobId) {
+    resetResult()
+    setStatus('Idle', 'Deleted the active saved run.')
+  }
+}
+
+function clearHistory() {
+  localStorage.removeItem(HISTORY_KEY)
+  renderHistory()
+}
+
+function currentApiBase() {
+  return els.apiBase.value.trim() || '/api'
+}
+
+function elapsedSeconds() {
+  if (!state.startedAt) return 0
+  return Math.round((Date.now() - state.startedAt) / 1000)
+}
+
+function elapsedSecondsFromResult(result: ResultJson): number | undefined {
+  const start = Date.parse(result.started_at || result.created_at || '')
+  const end = Date.parse(result.completed_at || '')
+  if (Number.isNaN(start) || Number.isNaN(end)) return undefined
+  return Math.max(0, Math.round((end - start) / 1000))
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer) {
+  const bytes = new Uint8Array(buffer)
+  let binary = ''
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+  }
+  return btoa(binary)
+}
+
+function base64ToArrayBuffer(value: string) {
+  const binary = atob(value)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+  return bytes.buffer
+}
+
+function formatTime(date: Date) {
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function formatDateTime(value: string) {
+  const date = new Date(value)
+  if (Number.isNaN(date.valueOf())) return 'unknown'
+  return date.toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
 }
 
 function get2d(canvas: HTMLCanvasElement) {

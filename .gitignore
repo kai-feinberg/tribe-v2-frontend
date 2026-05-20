@@ -11,7 +11,8 @@ node_modules
 dist
 dist-ssr
 *.local
-e2e-result.png
+*result.png
+*restore.png
 
 # Editor directories and files
 .vscode/*
