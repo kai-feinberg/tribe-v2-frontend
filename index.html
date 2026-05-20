@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TRIBE V2 Brain Viewer</title>
+  </head>
+  <body>
+    <div id="app">
+      <main class="shell">
+        <header class="topbar">
+          <div>
+            <h1>TRIBE V2 Brain Viewer</h1>
+            <p class="lede">
+              Submit text to a private TRIBE V2 API, poll the async job, then inspect approximate activation regions, timeline movement, and the normalized prediction blob.
+            </p>
+          </div>
+          <div class="connection">
+            <label>
+              API base URL
+              <input id="api-base" value="/api" autocomplete="off" />
+            </label>
+            <label>
+              Bearer token
+              <input id="bearer-token" type="password" placeholder="Optional for v1" autocomplete="off" />
+            </label>
+          </div>
+        </header>
+
+        <section class="layout">
+          <aside class="panel input-panel">
+            <label>
+              Text input
+              <textarea id="prompt-text" placeholder="Paste a script, prompt, paragraph, or other text stimulus..."></textarea>
+            </label>
+            <div class="actions">
+              <button id="run-button" type="button">Run text inference</button>
+              <button id="sample-button" class="secondary" type="button">Use sample</button>
+            </div>
+
+            <div class="status-card">
+              <div class="status-line">
+                <div>
+                  <span>Status</span>
+                  <strong id="status">Idle</strong>
+                </div>
+                <div>
+                  <span>Elapsed</span>
+                  <strong id="elapsed">--</strong>
+                </div>
+              </div>
+              <p id="status-detail" class="note">Connect to the API, then run a text prediction.</p>
+              <div class="facts">
+                <div class="fact">
+                  <span>Job</span>
+                  <strong id="job-id">--</strong>
+                </div>
+                <div class="fact">
+                  <span>Mode</span>
+                  <strong>Text MVP</strong>
+                </div>
+              </div>
+            </div>
+
+            <details>
+              <summary>API metadata</summary>
+              <pre id="metadata">Loading...</pre>
+            </details>
+          </aside>
+
+          <section class="viewer">
+            <div id="region-grid" class="region-grid"></div>
+
+            <div id="result-panel" class="panel canvas-panel" hidden>
+              <div class="timeline-controls">
+                <label>
+                  Timeline
+                  <input id="timestep" type="range" min="0" max="0" value="0" />
+                </label>
+                <strong id="timestep-label">--</strong>
+              </div>
+              <canvas id="timeline-canvas"></canvas>
+              <div class="brain-wrap">
+                <h2>Interactive Activation Map</h2>
+                <canvas id="brain-canvas"></canvas>
+              </div>
+              <p id="result-note" class="note"></p>
+              <details>
+                <summary>Raw result.json</summary>
+                <pre id="raw-json"></pre>
+              </details>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
