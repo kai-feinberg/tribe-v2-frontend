@@ -2,7 +2,37 @@
 
 Local frontend for the TRIBE V2 API template. It accepts text input, submits an
 async job, polls until completion, downloads `result.json` plus
-`preds.norm.f16.bin`, and renders approximate activation regions and a timeline.
+`preds.norm.f16.bin`, and renders cognitive-domain cards, interpretive proxy
+axes, a timeline, and an interactive brain viewer.
+
+## Start Everything Locally
+
+Use two terminals.
+
+Terminal 1 keeps the private VPS API tunnel open:
+
+```bash
+ssh -N -i ~/.ssh/hetzner_tribev2 -L 8000:localhost:8000 root@204.168.145.117
+```
+
+Terminal 2 runs the frontend:
+
+```bash
+cd /Users/kai/Desktop/projects/explorations/tribe-v2-brain-viewer
+pnpm install
+pnpm dev
+```
+
+Open [http://127.0.0.1:5173](http://127.0.0.1:5173). The default API base in
+the UI is `/api`, which Vite proxies to `http://127.0.0.1:8000` through the SSH
+tunnel.
+
+Quick checks:
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:5173/api/metadata
+```
 
 ## Run The Frontend
 
@@ -12,8 +42,8 @@ cp .env.example .env
 pnpm dev
 ```
 
-Open [http://127.0.0.1:5173](http://127.0.0.1:5173). The default API base in
-the UI is `/api`, which Vite proxies to `VITE_TRIBE_API_TARGET`.
+The default API proxy target is `http://127.0.0.1:8000`. Override it with
+`VITE_TRIBE_API_TARGET` if needed.
 
 ## Start The API On The VPS
 
@@ -36,8 +66,10 @@ Then the frontend can call `/api`, proxied to `http://127.0.0.1:8000`.
 
 - V1 has no bearer auth on the API, but the UI already has a bearer token field
   so the request path will not need to change later.
-- Region cards use the same approximate vertex-band scoring idea from the
-  `script-brain-optimizer` reference. Atlas-backed Yeo7/Destrieux reductions
-  should move into the API when that backend output is implemented.
+- Region cards prefer API-provided Destrieux atlas cognitive domains and
+  interpretive proxy axes. If an older API response lacks those fields, the UI
+  falls back to approximate frontend vertex-band scoring.
+- Yeo7 network reductions are not integrated yet. They remain a future API
+  output, separate from the Destrieux domains already shown here.
 - The interactive brain panel renders from the normalized float16 prediction
   blob. It is a frontend inspection view, not a scientific cortical atlas.

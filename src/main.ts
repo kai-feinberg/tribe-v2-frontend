@@ -448,7 +448,7 @@ function renderAll() {
   els.timestepLabel.textContent = `TR ${t + 1}/${result.prediction.shape[0]} at ${seconds.toFixed(1)}s`
   els.note.textContent =
     result.summary.note ||
-    'Region scores are approximate frontend reductions until the API exposes atlas-backed Yeo7 and Destrieux outputs.'
+    'Destrieux cognitive domains and interpretive proxy axes are included when exposed by the API. Yeo7 network reductions remain a future extension.'
   els.statusDetail.textContent = `${result.prediction.shape[0]} timesteps, ${result.prediction.shape[1].toLocaleString()} vertices, ${result.events.count} events`
   els.lastUpdate.textContent = formatTime(new Date())
   renderCards(t)
