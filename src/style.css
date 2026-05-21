@@ -191,6 +191,31 @@ textarea {
   gap: 8px;
 }
 
+.job-progress {
+  display: grid;
+  gap: 5px;
+}
+
+.job-progress-bar {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #d8d0c4;
+}
+
+.job-progress-bar span {
+  display: block;
+  width: 0%;
+  height: 100%;
+  background: linear-gradient(90deg, #129b72, #2b7de9);
+  transition: width 0.25s ease;
+}
+
+.progress-meta {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .fact {
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -352,6 +377,17 @@ textarea {
   min-height: 380px;
 }
 
+.brain-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.brain-head label {
+  width: min(220px, 45%);
+}
+
 #brain-canvas,
 #timeline-canvas {
   display: block;
@@ -363,6 +399,7 @@ textarea {
 
 #brain-canvas {
   height: 340px;
+  touch-action: none;
 }
 
 #timeline-canvas {

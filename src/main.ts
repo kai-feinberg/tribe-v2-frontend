@@ -1,4 +1,6 @@
 import './style.css'
+import * as THREE from 'three'
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 
 type JobStatus = 'queued' | 'running' | 'completed' | 'failed'
 
@@ -9,6 +11,13 @@ type JobRecord = {
   started_at?: string
   completed_at?: string
   error?: string | null
+  phase?: string
+  phase_detail?: string
+  progress_percent?: number
+  processed_segments?: number | null
+  total_segments?: number | null
+  kept_segments?: number | null
+  logs_tail?: string[]
 }
 
 type ResultJson = {
@@ -37,6 +46,21 @@ type ResultJson = {
     note?: string
   }
   events: { count: number }
+  cognitive_domains?: {
+    scores: Record<string, number>
+    time_series: Record<string, number[]>
+    descriptions?: Record<string, string>
+    metadata?: Record<string, unknown>
+  }
+  interpretive_axes?: {
+    scores: Record<string, number>
+    time_series: Record<string, number[]>
+    metadata?: {
+      interpretive?: boolean
+      warning?: string
+      [key: string]: unknown
+    }
+  }
 }
 
 type Region = {
@@ -50,6 +74,8 @@ type Region = {
 type RegionScore = Region & {
   score: number
   series: number[]
+  category: 'domain' | 'axis'
+  interpretive?: boolean
 }
 
 type StoredRun = {
@@ -64,6 +90,35 @@ type StoredRun = {
   result?: ResultJson
   predictionBinBase64?: string
   error?: string | null
+}
+
+type MeshData = {
+  vL: Float32Array
+  fL: Uint32Array
+  sL: Float32Array
+  vR: Float32Array
+  fR: Uint32Array
+  sR: Float32Array
+  nVL: number
+  nVR: number
+}
+
+type BrainHemi = {
+  mesh: THREE.Mesh
+  colors: Float32Array
+  sulc: Float32Array
+  smin: number
+  span: number
+  nV: number
+}
+
+type BrainViewer = {
+  scene: THREE.Scene
+  camera: THREE.PerspectiveCamera
+  renderer: THREE.WebGLRenderer
+  controls: OrbitControls
+  hemis: BrainHemi[]
+  resizeObserver: ResizeObserver
 }
 
 const HISTORY_KEY = 'tribeRunHistory.v1'
@@ -122,6 +177,8 @@ const els = {
   sample: byId<HTMLButtonElement>('sample-button'),
   status: byId<HTMLElement>('status'),
   statusDetail: byId<HTMLElement>('status-detail'),
+  progressFill: byId<HTMLElement>('progress-fill'),
+  progressMeta: byId<HTMLElement>('progress-meta'),
   jobId: byId<HTMLElement>('job-id'),
   elapsed: byId<HTMLElement>('elapsed'),
   lastUpdate: byId<HTMLElement>('last-update'),
@@ -132,6 +189,7 @@ const els = {
   resultPanel: byId<HTMLElement>('result-panel'),
   timelineCanvas: byId<HTMLCanvasElement>('timeline-canvas'),
   brainCanvas: byId<HTMLCanvasElement>('brain-canvas'),
+  brainThreshold: byId<HTMLInputElement>('brain-threshold'),
   timestep: byId<HTMLInputElement>('timestep'),
   timestepLabel: byId<HTMLElement>('timestep-label'),
   note: byId<HTMLElement>('result-note'),
@@ -147,6 +205,7 @@ const state: {
   startedAt?: number
   activeJobId?: string
   activeTextPreview?: string
+  brain?: BrainViewer
 } = {
   regionScores: [],
   selectedTimestep: 0,
@@ -165,6 +224,7 @@ els.timestep.addEventListener('input', () => {
   state.selectedTimestep = Number(els.timestep.value)
   renderAll()
 })
+els.brainThreshold.addEventListener('input', () => renderBrain(state.selectedTimestep))
 
 void loadMetadata()
 renderEmpty()
@@ -220,8 +280,12 @@ async function checkJob(jobId: string) {
   try {
     const job = await apiFetch<JobRecord>(`/jobs/${jobId}`)
     updateElapsed()
+    renderProgress(job)
     if (job.status === 'queued' || job.status === 'running') {
-      setStatus(job.status === 'queued' ? 'Queued' : 'Running', 'The CPU worker is processing one job at a time.')
+      setStatus(
+        job.status === 'queued' ? 'Queued' : 'Running',
+        job.phase_detail || 'The CPU worker is processing one job at a time.',
+      )
       upsertRun({
         jobId,
         status: job.status,
@@ -255,6 +319,8 @@ async function checkJob(jobId: string) {
     await loadResult(jobId)
     setBusy(false)
     setStatus('Complete', 'Prediction ready.')
+    els.progressFill.style.width = '100%'
+    els.progressMeta.textContent = '100% · completed'
   } catch (error) {
     window.clearInterval(state.poll)
     setBusy(false)
@@ -305,6 +371,35 @@ async function loadMetadata() {
 }
 
 function computeRegionScores(result: ResultJson, preds: Float32Array): RegionScore[] {
+  if (result.cognitive_domains?.scores && Object.keys(result.cognitive_domains.scores).length) {
+    const descriptions = result.cognitive_domains.descriptions || {}
+    const domains = Object.entries(result.cognitive_domains.scores)
+      .filter(([name]) => name !== 'Overall Impact')
+      .map(([name, score], index) => ({
+        name,
+        start: 0,
+        end: 1,
+        color: palette(index),
+        description: descriptions[name] || 'Atlas-backed cognitive domain from predicted activation.',
+        score,
+        series: result.cognitive_domains?.time_series?.[name] || [],
+        category: 'domain' as const,
+      }))
+
+    const axes = Object.entries(result.interpretive_axes?.scores || {}).map(([name, score], index) => ({
+      name,
+      start: 0,
+      end: 1,
+      color: palette(index + domains.length),
+      description: 'Interpretive proxy derived from cognitive-domain activation. Not a direct emotion measurement.',
+      score,
+      series: result.interpretive_axes?.time_series?.[name] || [],
+      category: 'axis' as const,
+      interpretive: true,
+    }))
+    return [...domains, ...axes].sort((a, b) => b.score - a.score)
+  }
+
   const [timesteps, vertices] = result.prediction.shape
   if (!timesteps || !vertices || preds.length !== timesteps * vertices) return []
 
@@ -325,7 +420,7 @@ function computeRegionScores(result: ResultJson, preds: Float32Array): RegionSco
       series.push(count ? sum / count / globalMax : 0)
     }
     const score = series.reduce((acc, value) => acc + value, 0) / Math.max(1, series.length)
-    return { ...region, score, series }
+    return { ...region, score, series, category: 'domain' as const }
   }).sort((a, b) => b.score - a.score)
 }
 
@@ -361,6 +456,16 @@ function renderAll() {
   renderBrain(t)
 }
 
+function renderProgress(job: JobRecord) {
+  const pct = Math.max(0, Math.min(100, job.progress_percent ?? 0))
+  els.progressFill.style.width = `${pct}%`
+  const segmentText =
+    job.total_segments && job.processed_segments != null
+      ? ` · ${job.processed_segments}/${job.total_segments} segments`
+      : ''
+  els.progressMeta.textContent = `${pct}% · ${job.phase || job.status}${segmentText}`
+}
+
 function renderCards(t: number) {
   els.regionGrid.innerHTML = state.regionScores
     .map((region) => {
@@ -378,11 +483,16 @@ function renderCards(t: number) {
           </div>
           <strong>${pct.toFixed(1)}</strong>
           <div class="meter" style="--meter:${pct}%;--color:${region.color}"><span></span></div>
-          <small>Current timestep ${currentPct.toFixed(1)}</small>
+          <small>${region.interpretive ? 'Interpretive proxy' : 'Atlas domain'} · current ${currentPct.toFixed(1)}</small>
         </article>
       `
     })
     .join('')
+}
+
+function palette(index: number) {
+  const colors = ['#2b7de9', '#d95c39', '#129b72', '#7a68d8', '#b1711e', '#cf4a7d', '#1d8a99', '#96532f', '#4f7b2d', '#a43f63', '#5260c8', '#c18415', '#475569']
+  return colors[index % colors.length]
 }
 
 function renderTimeline(selected: number) {
@@ -440,73 +550,276 @@ function drawSeries(
 }
 
 function renderBrain(t: number) {
-  const canvas = els.brainCanvas
-  const ctx = get2d(canvas)
-  const width = canvas.width = canvas.clientWidth * devicePixelRatio
-  const height = canvas.height = canvas.clientHeight * devicePixelRatio
-  ctx.scale(devicePixelRatio, devicePixelRatio)
-  const w = width / devicePixelRatio
-  const h = height / devicePixelRatio
-  ctx.clearRect(0, 0, w, h)
-
-  const cx = w / 2
-  const cy = h / 2
-  const brainW = Math.min(w * 0.74, 560)
-  const brainH = Math.min(h * 0.72, 250)
-  drawHemisphere(ctx, cx - brainW * 0.27, cy, brainW * 0.48, brainH, false, t)
-  drawHemisphere(ctx, cx + brainW * 0.27, cy, brainW * 0.48, brainH, true, t)
-  ctx.fillStyle = '#6b7280'
-  ctx.font = '12px ui-monospace, monospace'
-  ctx.fillText('Approximate cortical bands from normalized fsaverage5 vertex blob', 18, h - 18)
+  if (!state.preds || !state.result) return
+  if (!hasWebgl()) {
+    drawFallbackBrain(t)
+    return
+  }
+  if (!state.brain) {
+    void initBrainViewer()
+      .then(() => applyBrainColors(t))
+      .catch(() => drawFallbackBrain(t))
+    return
+  }
+  applyBrainColors(t)
 }
 
-function drawHemisphere(
+function hasWebgl() {
+  const canvas = document.createElement('canvas')
+  return Boolean(canvas.getContext('webgl2') || canvas.getContext('webgl'))
+}
+
+async function initBrainViewer() {
+  const mesh = await fetchMesh(`${currentApiBase()}/mesh/fsaverage5.bin`)
+  const scene = new THREE.Scene()
+  scene.background = new THREE.Color(0xf8f5ed)
+  const width = els.brainCanvas.clientWidth || 800
+  const height = els.brainCanvas.clientHeight || 360
+  const camera = new THREE.PerspectiveCamera(35, width / height, 1, 5000)
+  const renderer = new THREE.WebGLRenderer({ canvas: els.brainCanvas, antialias: true })
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2))
+  renderer.setSize(width, height, false)
+  const controls = new OrbitControls(camera, els.brainCanvas)
+  controls.enableDamping = true
+  controls.dampingFactor = 0.1
+  scene.add(new THREE.AmbientLight(0xffffff, 0.65))
+  const keyLight = new THREE.DirectionalLight(0xffffff, 0.9)
+  keyLight.position.set(80, 140, 220)
+  scene.add(keyLight)
+  const fillLight = new THREE.DirectionalLight(0xd4e1ff, 0.35)
+  fillLight.position.set(-120, -60, 120)
+  scene.add(fillLight)
+
+  const hemis = [
+    buildHemi(mesh.vL, mesh.fL, mesh.sL, mesh.nVL, scene),
+    buildHemi(mesh.vR, mesh.fR, mesh.sR, mesh.nVR, scene),
+  ]
+  const box = new THREE.Box3()
+  hemis.forEach((hemi) => box.expandByObject(hemi.mesh))
+  const center = box.getCenter(new THREE.Vector3())
+  const size = box.getSize(new THREE.Vector3()).length()
+  controls.target.copy(center)
+  camera.position.set(center.x, center.y + size * 0.08, center.z + size * 1.08)
+  camera.lookAt(center)
+
+  const resizeObserver = new ResizeObserver(() => {
+    const nextWidth = els.brainCanvas.clientWidth || width
+    const nextHeight = els.brainCanvas.clientHeight || height
+    renderer.setSize(nextWidth, nextHeight, false)
+    camera.aspect = nextWidth / nextHeight
+    camera.updateProjectionMatrix()
+  })
+  resizeObserver.observe(els.brainCanvas)
+
+  state.brain = { scene, camera, renderer, controls, hemis, resizeObserver }
+  const loop = () => {
+    if (!state.brain) return
+    controls.update()
+    renderer.render(scene, camera)
+    requestAnimationFrame(loop)
+  }
+  loop()
+}
+
+function drawFallbackBrain(t: number) {
+  if (!state.preds || !state.result) return
+  state.brain?.resizeObserver.disconnect()
+  state.brain = undefined
+  const canvas = els.brainCanvas
+  const rect = canvas.getBoundingClientRect()
+  const dpr = Math.min(window.devicePixelRatio || 1, 2)
+  const width = Math.max(320, Math.floor(rect.width || canvas.clientWidth || 760))
+  const height = Math.max(260, Math.floor(rect.height || canvas.clientHeight || 340))
+  canvas.width = Math.floor(width * dpr)
+  canvas.height = Math.floor(height * dpr)
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  ctx.scale(dpr, dpr)
+  ctx.clearRect(0, 0, width, height)
+  ctx.fillStyle = '#f8f5ed'
+  ctx.fillRect(0, 0, width, height)
+
+  const [timesteps, vertices] = state.result.prediction.shape
+  const idx = Math.max(0, Math.min(timesteps - 1, t))
+  const rowStart = idx * vertices
+  const half = Math.floor(vertices / 2)
+  const threshold = Number(els.brainThreshold.value)
+  const left = sampleActivationBuckets(rowStart, 0, half, 9)
+  const right = sampleActivationBuckets(rowStart, half, vertices - half, 9)
+
+  drawHemisphereFallback(ctx, width * 0.35, height * 0.52, width * 0.24, height * 0.34, left, threshold, 'L')
+  drawHemisphereFallback(ctx, width * 0.65, height * 0.52, width * 0.24, height * 0.34, right, threshold, 'R')
+
+  ctx.fillStyle = '#6b6257'
+  ctx.font = '12px ui-monospace, monospace'
+  ctx.fillText('2D fallback active: WebGL is unavailable in this browser session.', 18, height - 18)
+}
+
+function sampleActivationBuckets(rowStart: number, offset: number, length: number, buckets: number) {
+  if (!state.preds) return []
+  const values: number[] = []
+  const bucketSize = Math.max(1, Math.floor(length / buckets))
+  for (let bucket = 0; bucket < buckets; bucket += 1) {
+    const start = rowStart + offset + bucket * bucketSize
+    const end = Math.min(rowStart + offset + length, start + bucketSize)
+    let peak = 0
+    let count = 0
+    for (let i = start; i < end; i += 29) {
+      peak = Math.max(peak, state.preds[i] || 0)
+      count += 1
+    }
+    values.push(count ? peak : 0)
+  }
+  return values
+}
+
+function drawHemisphereFallback(
   ctx: CanvasRenderingContext2D,
   cx: number,
   cy: number,
-  w: number,
-  h: number,
-  right: boolean,
-  t: number,
+  rx: number,
+  ry: number,
+  values: number[],
+  threshold: number,
+  label: string,
 ) {
   ctx.save()
-  ctx.translate(cx, cy)
-  ctx.scale(right ? 1 : -1, 1)
   ctx.beginPath()
-  ctx.moveTo(-w * 0.45, h * 0.08)
-  ctx.bezierCurveTo(-w * 0.54, -h * 0.44, w * 0.22, -h * 0.62, w * 0.48, -h * 0.1)
-  ctx.bezierCurveTo(w * 0.68, h * 0.28, w * 0.16, h * 0.58, -w * 0.32, h * 0.36)
-  ctx.bezierCurveTo(-w * 0.48, h * 0.28, -w * 0.5, h * 0.18, -w * 0.45, h * 0.08)
-  ctx.closePath()
-  ctx.fillStyle = '#ece8dd'
-  ctx.fill()
-  ctx.lineWidth = 1
-  ctx.strokeStyle = '#c8c1b5'
-  ctx.stroke()
+  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2)
   ctx.clip()
-
-  state.regionScores.forEach((region, index) => {
-    const intensity = Math.max(0, Math.min(1, region.series[t] ?? region.score))
-    const x = -w * 0.42 + (index / Math.max(1, REGIONS.length - 1)) * w * 0.82
-    const y = Math.sin(index * 1.4) * h * 0.17
-    const radius = (0.15 + intensity * 0.24) * Math.min(w, h)
-    const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius)
-    gradient.addColorStop(0, hexToRgba(region.color, 0.84))
-    gradient.addColorStop(1, hexToRgba(region.color, 0))
-    ctx.fillStyle = gradient
-    ctx.fillRect(-w, -h, w * 2, h * 2)
-  })
-
-  ctx.globalAlpha = 0.22
-  ctx.strokeStyle = '#514b45'
-  ctx.lineWidth = 2
-  for (let i = 0; i < 7; i += 1) {
+  const sulci = 16
+  for (let i = 0; i < sulci; i += 1) {
+    const y = cy - ry + (i / (sulci - 1)) * ry * 2
+    const shade = i % 2 ? '#d7d0c4' : '#eee8dc'
+    ctx.strokeStyle = shade
+    ctx.lineWidth = 9
     ctx.beginPath()
-    ctx.moveTo(-w * 0.35 + i * w * 0.12, -h * 0.32)
-    ctx.bezierCurveTo(-w * 0.52 + i * w * 0.15, -h * 0.06, -w * 0.24 + i * w * 0.12, h * 0.14, -w * 0.32 + i * w * 0.14, h * 0.34)
+    ctx.moveTo(cx - rx * 0.9, y)
+    ctx.bezierCurveTo(cx - rx * 0.35, y - 18, cx + rx * 0.35, y + 18, cx + rx * 0.9, y)
     ctx.stroke()
   }
+  const points = [
+    [-0.45, -0.45], [0, -0.5], [0.42, -0.38],
+    [-0.55, 0], [-0.02, 0.03], [0.5, 0.05],
+    [-0.38, 0.45], [0.08, 0.5], [0.48, 0.38],
+  ]
+  values.forEach((value, index) => {
+    if (value < threshold) return
+    const point = points[index] || [0, 0]
+    const intensity = (value - threshold) / Math.max(1e-9, 1 - threshold)
+    const [r, g, b] = fireColor(intensity)
+    const radius = 22 + intensity * 48
+    const gradient = ctx.createRadialGradient(
+      cx + point[0] * rx,
+      cy + point[1] * ry,
+      0,
+      cx + point[0] * rx,
+      cy + point[1] * ry,
+      radius,
+    )
+    gradient.addColorStop(0, `rgba(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)}, 0.88)`)
+    gradient.addColorStop(1, 'rgba(255, 255, 255, 0)')
+    ctx.fillStyle = gradient
+    ctx.beginPath()
+    ctx.arc(cx + point[0] * rx, cy + point[1] * ry, radius, 0, Math.PI * 2)
+    ctx.fill()
+  })
   ctx.restore()
+  ctx.strokeStyle = '#9d9284'
+  ctx.lineWidth = 1.5
+  ctx.beginPath()
+  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2)
+  ctx.stroke()
+  ctx.fillStyle = '#28231f'
+  ctx.font = '700 13px ui-monospace, monospace'
+  ctx.fillText(label, cx - 4, cy + 4)
+}
+
+function buildHemi(
+  verts: Float32Array,
+  faces: Uint32Array,
+  sulc: Float32Array,
+  nV: number,
+  scene: THREE.Scene,
+): BrainHemi {
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.BufferAttribute(verts, 3))
+  geometry.setIndex(new THREE.BufferAttribute(faces, 1))
+  geometry.computeVertexNormals()
+  const colors = new Float32Array(nV * 3)
+  const smin = Math.min(...sulc)
+  const smax = Math.max(...sulc)
+  const span = Math.max(1e-9, smax - smin)
+  for (let i = 0; i < nV; i += 1) {
+    const base = sulcBase(sulc[i], smin, span)
+    colors[i * 3] = base
+    colors[i * 3 + 1] = base
+    colors[i * 3 + 2] = base
+  }
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+  const material = new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    roughness: 0.86,
+    metalness: 0,
+    side: THREE.DoubleSide,
+  })
+  const mesh = new THREE.Mesh(geometry, material)
+  scene.add(mesh)
+  return { mesh, colors, sulc, smin, span, nV }
+}
+
+function applyBrainColors(t: number) {
+  if (!state.brain || !state.preds || !state.result) return
+  const [timesteps, vertices] = state.result.prediction.shape
+  const idx = Math.max(0, Math.min(timesteps - 1, t))
+  const threshold = Number(els.brainThreshold.value)
+  let cursor = 0
+  for (const hemi of state.brain.hemis) {
+    for (let i = 0; i < hemi.nV; i += 1) {
+      const activation = state.preds[idx * vertices + cursor + i] || 0
+      const color = activation < threshold
+        ? [sulcBase(hemi.sulc[i], hemi.smin, hemi.span), sulcBase(hemi.sulc[i], hemi.smin, hemi.span), sulcBase(hemi.sulc[i], hemi.smin, hemi.span)]
+        : fireColor((activation - threshold) / Math.max(1e-9, 1 - threshold))
+      hemi.colors[i * 3] = color[0]
+      hemi.colors[i * 3 + 1] = color[1]
+      hemi.colors[i * 3 + 2] = color[2]
+    }
+    const colorAttr = hemi.mesh.geometry.getAttribute('color') as THREE.BufferAttribute
+    colorAttr.needsUpdate = true
+    cursor += hemi.nV
+  }
+}
+
+function sulcBase(value: number, min: number, span: number) {
+  const t = (value - min) / span
+  return 0.38 + (1 - t) * 0.38
+}
+
+function fireColor(value: number): [number, number, number] {
+  const t = Math.max(0, Math.min(1, value))
+  if (t < 0.33) return [t / 0.33, 0.05, 0.02]
+  if (t < 0.66) return [1, (t - 0.33) / 0.33, 0.03]
+  return [1, 1, (t - 0.66) / 0.34]
+}
+
+async function fetchMesh(url: string): Promise<MeshData> {
+  const buffer = await fetch(url).then((response) => {
+    if (!response.ok) throw new Error(`Mesh request failed: ${response.status}`)
+    return response.arrayBuffer()
+  })
+  const view = new DataView(buffer)
+  let offset = 0
+  const nVL = view.getUint32(offset, true); offset += 4
+  const nFL = view.getUint32(offset, true); offset += 4
+  const nVR = view.getUint32(offset, true); offset += 4
+  const nFR = view.getUint32(offset, true); offset += 4
+  const vL = new Float32Array(buffer, offset, nVL * 3); offset += nVL * 3 * 4
+  const fL = new Uint32Array(buffer, offset, nFL * 3); offset += nFL * 3 * 4
+  const sL = new Float32Array(buffer, offset, nVL); offset += nVL * 4
+  const vR = new Float32Array(buffer, offset, nVR * 3); offset += nVR * 3 * 4
+  const fR = new Uint32Array(buffer, offset, nFR * 3); offset += nFR * 3 * 4
+  const sR = new Float32Array(buffer, offset, nVR)
+  return { vL, fL, sL, vR, fR, sR, nVL, nVR }
 }
 
 function renderEmpty() {
@@ -535,6 +848,8 @@ function resetResult() {
   els.jobId.textContent = '--'
   els.elapsed.textContent = '--'
   els.lastUpdate.textContent = '--'
+  els.progressFill.style.width = '0%'
+  els.progressMeta.textContent = '0% · waiting'
   els.resultPanel.hidden = true
   els.rawJson.textContent = ''
   renderEmpty()
@@ -678,6 +993,8 @@ async function openStoredRun(jobId: string) {
 
   if (run.status === 'completed' && run.result && run.predictionBinBase64) {
     setStatus('Loaded saved run', 'Result restored from local storage.')
+    els.progressFill.style.width = '100%'
+    els.progressMeta.textContent = '100% · completed'
     applyResult(run.result, base64ToArrayBuffer(run.predictionBinBase64))
     return
   }
@@ -770,14 +1087,6 @@ function get2d(canvas: HTMLCanvasElement) {
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('Canvas 2D context is unavailable.')
   return ctx
-}
-
-function hexToRgba(hex: string, alpha: number) {
-  const normalized = hex.replace('#', '')
-  const r = Number.parseInt(normalized.slice(0, 2), 16)
-  const g = Number.parseInt(normalized.slice(2, 4), 16)
-  const b = Number.parseInt(normalized.slice(4, 6), 16)
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`
 }
 
 function readableError(error: unknown) {

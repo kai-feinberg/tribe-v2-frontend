@@ -51,6 +51,10 @@
                 </div>
               </div>
               <p id="status-detail" class="note">Connect to the API, then run a text prediction.</p>
+              <div class="job-progress">
+                <div class="job-progress-bar"><span id="progress-fill"></span></div>
+                <div id="progress-meta" class="progress-meta">0% · waiting</div>
+              </div>
               <div class="facts">
                 <div class="fact">
                   <span>Job</span>
@@ -90,7 +94,13 @@
               </div>
               <canvas id="timeline-canvas"></canvas>
               <div class="brain-wrap">
-                <h2>Interactive Activation Map</h2>
+                <div class="brain-head">
+                  <h2>Interactive fsaverage5 Brain</h2>
+                  <label>
+                    Threshold
+                    <input id="brain-threshold" type="range" min="0" max="1" step="0.02" value="0.6" />
+                  </label>
+                </div>
                 <canvas id="brain-canvas"></canvas>
               </div>
               <p id="result-note" class="note"></p>
