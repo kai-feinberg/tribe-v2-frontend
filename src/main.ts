@@ -860,7 +860,7 @@ async function apiFetch<T>(
   init?: RequestInit,
   mode: 'json' | 'arrayBuffer' = 'json',
 ): Promise<T> {
-  const base = els.apiBase.value.trim().replace(/\/$/, '')
+  const base = currentApiBase().replace(/\/$/, '')
   const url = `${base}${path}`
   const headers = new Headers(init?.headers)
   const token = els.token.value.trim()
