@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev-tunnel": "bash scripts/dev-tunnel.sh",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },

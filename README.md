@@ -9,6 +9,18 @@ axes, a timeline, and an interactive brain viewer.
 
 Use two terminals.
 
+One-command path:
+
+```bash
+cd /Users/kai/Desktop/projects/explorations/tribe-v2-brain-viewer
+pnpm dev-tunnel
+```
+
+This opens the SSH tunnel, waits for the API health check, then starts Vite.
+Use `/api` as the API base URL in the UI.
+
+Manual two-terminal path:
+
 Terminal 1 keeps the private VPS API tunnel open:
 
 ```bash
